@@ -1,0 +1,260 @@
+name: Security Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ============================================
+  # Job 1: Run Tests with Coverage
+  # ============================================
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for SonarQube
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v --cov=src --cov-report=xml --cov-report=html --cov-report=term-missing
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+          retention-days: 7
+
+  # ============================================
+  # Job 2: Bandit Security Scan
+  # ============================================
+  bandit:
+    name: Bandit Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install Bandit
+        run: pip install bandit[toml]
+      
+      - name: Run Bandit scan
+        run: |
+          bandit -r src/ -f json -o bandit-report.json --exit-zero
+          bandit -r src/ -f txt -o bandit-report.txt --exit-zero
+          echo "=== Bandit Security Report ===" 
+          cat bandit-report.txt
+      
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: |
+            bandit-report.json
+            bandit-report.txt
+          retention-days: 7
+      
+      - name: Check for high severity issues
+        run: |
+          # Fail if high severity issues found
+          bandit -r src/ -ll -ii --exit-zero || true
+          HIGH_COUNT=$(bandit -r src/ -f json -ll -ii 2>/dev/null | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('results',[])))" 2>/dev/null || echo "0")
+          echo "High/Medium severity issues found: $HIGH_COUNT"
+          if [ "$HIGH_COUNT" -gt "0" ]; then
+            echo "::warning::Bandit found $HIGH_COUNT high/medium severity security issues"
+          fi
+
+  # ============================================
+  # Job 3: Trivy Vulnerability Scan
+  # ============================================
+  trivy:
+    name: Trivy Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner (filesystem)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      
+      - name: Run Trivy and save JSON report
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-report.json'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+      
+      - name: Run Trivy SARIF report
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '0'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: |
+            trivy-report.json
+            trivy-results.sarif
+          retention-days: 7
+      
+      - name: Upload Trivy SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
+
+  # ============================================
+  # Job 4: OSV Scanner
+  # ============================================
+  osv-scanner:
+    name: OSV Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run OSV Scanner
+        uses: google/osv-scanner-action@v1
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --lockfile=requirements.txt
+            --format=json
+            --output=osv-report.json
+            .
+      
+      - name: Run OSV Scanner (table output)
+        uses: google/osv-scanner-action@v1
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --lockfile=requirements.txt
+            .
+      
+      - name: Upload OSV report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: osv-report
+          path: osv-report.json
+          retention-days: 7
+
+  # ============================================
+  # Job 5: SonarQube Analysis
+  # ============================================
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: test  # Wait for test coverage
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for better analysis
+      
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+      
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+      
+      # Optional: Fail pipeline if quality gate fails
+      # - name: SonarQube Quality Gate check
+      #   uses: SonarSource/sonarqube-quality-gate-action@master
+      #   timeout-minutes: 5
+      #   env:
+      #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ============================================
+  # Job 6: Security Summary
+  # ============================================
+  security-summary:
+    name: Security Summary
+    runs-on: ubuntu-latest
+    needs: [bandit, trivy, osv-scanner, sonarqube]
+    if: always()
+    
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports
+      
+      - name: Generate summary
+        run: |
+          echo "# Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Bandit | ${{ needs.bandit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy | ${{ needs.trivy.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OSV Scanner | ${{ needs.osv-scanner.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SonarQube | ${{ needs.sonarqube.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Reports" >> $GITHUB_STEP_SUMMARY
+          echo "All security reports are available as artifacts." >> $GITHUB_STEP_SUMMARY
+      
+      - name: List downloaded reports
+        run: |
+          echo "Downloaded reports:"
+          find reports -type f -name "*.json" -o -name "*.txt" -o -name "*.sarif" | head -20
+
